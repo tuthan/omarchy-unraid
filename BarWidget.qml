@@ -25,7 +25,7 @@ BarWidget {
     : Api.statusLevel(snapshot)
 
   readonly property var dockerCounts: snapshot ? Api.dockerCounts(snapshot.containers) : { running: 0, total: 0 }
-  readonly property bool unraidTheme: setting("themeMode", "omarchy") === "unraid"
+  readonly property bool unraidTheme: setting("themeMode", "unraid") !== "omarchy"
   readonly property color themeAccent: unraidTheme ? "#EE7F3C" : Color.accent
   readonly property color themeUrgent: unraidTheme ? "#D64541" : Color.urgent
 

@@ -67,8 +67,8 @@ Open the panel and switch to the **Setup** tab:
   available for containers, VMs, the array, and parity checks. Destructive
   actions confirm inline: the button turns into `CONFIRM?` for four seconds;
   click again to fire.
-- **Theme** — follow the Omarchy palette (default) or switch to Unraid brand
-  colors (orange accent).
+- **Theme** — Unraid brand colors (orange accent) by default, or follow the
+  Omarchy palette.
 
 Settings are stored in `~/.config/omarchy/shell.json` under the widget's bar
 entry and survive restarts.
