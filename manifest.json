@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hvo.omarchy-unraid",
+  "name": "Unraid",
+  "version": "0.1.0",
+  "author": "hvo",
+  "license": "MIT",
+  "description": "Monitor an Unraid server from the bar: array state, disk health, Docker containers, and VMs.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Unraid",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
