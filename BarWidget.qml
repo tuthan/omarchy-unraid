@@ -166,8 +166,18 @@ BarWidget {
         sourceSize.height: Style.space(15)
         fillMode: Image.PreserveAspectFit
         smooth: true
-        visible: root.configured
         opacity: root.configured ? 1 : 0.4
+
+        Behavior on opacity { NumberAnimation { duration: 160 } }
+      }
+
+      Rectangle {
+        anchors.verticalCenter: parent.verticalCenter
+        visible: !root.configured
+        width: Style.space(6)
+        height: width
+        radius: width / 2
+        color: Color.muted
       }
 
       Rectangle {
