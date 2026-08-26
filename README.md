@@ -5,6 +5,10 @@ the bar, over the native Unraid GraphQL API (Unraid 7.2+).
 
 ![Unraid plugin preview](preview.png)
 
+# Video
+
+https://github.com/user-attachments/assets/944ab549-4224-49f4-8716-c34aeb8b98aa
+
 ## Install
 
 From the plugin repository:
