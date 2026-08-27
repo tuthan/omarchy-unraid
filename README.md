@@ -59,10 +59,15 @@ omarchy-shell shell rescanPlugins
 
 Open the panel and switch to the **Setup** tab:
 
-- **Server URL** — base URL of the Unraid server, for example
-  `http://tower.local` or `http://192.168.1.10`. The API is served at
-  `/graphql` on the plain HTTP listener; the HTTPS listener rejects API keys
-  on current Unraid builds.
+- **Server URL** — host or base URL of the Unraid server, for example
+  `tower.local` or `192.168.1.10`. The plugin appends `/graphql` when needed.
+- **Transport** — HTTPS is selected by default and verifies the server
+  certificate. HTTP is available as an explicit opt-in for Unraid setups that
+  do not accept API keys on their HTTPS listener; HTTP sends the API key in
+  cleartext and should only be used on a trusted network.
+- **Self-signed HTTPS certificate** — off by default. Enable this only when
+  the HTTPS endpoint uses a certificate you trust; it disables certificate
+  verification for the API requests.
 - **API key** — create one under Unraid web UI → Settings → Management
   Access. The key needs read access; management actions additionally need
   write roles for Docker, VMs, array, and parity check.

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hvo.omarchy-unraid",
   "name": "Unraid",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Hung Vo",
   "license": "MIT",
   "description": "Monitor an Unraid server from the bar: array state, disk health, Docker containers, and VMs.",

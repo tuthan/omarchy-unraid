@@ -11,7 +11,12 @@ BarWidget {
 
   readonly property string serverUrl: String(setting("serverUrl", "")).replace(/\s+/g, "")
   readonly property string apiKey: String(setting("apiKey", ""))
-  readonly property bool allowSelfSigned: setting("allowSelfSigned", true) === true
+  readonly property string transport: {
+    var configuredTransport = String(setting("transport", "")).toLowerCase()
+    if (configuredTransport === "http" || configuredTransport === "https") return configuredTransport
+    return /^http:\/\//i.test(serverUrl) ? "http" : "https"
+  }
+  readonly property bool allowSelfSigned: setting("allowSelfSigned", false) === true
   readonly property int pollSeconds: Api.clampPollSeconds(setting("pollSeconds", 30))
 
   readonly property bool configured: serverUrl !== "" && apiKey !== ""
@@ -36,7 +41,7 @@ BarWidget {
   function refresh() {
     if (!configured) return
     if (proc.running) return
-    proc.command = Api.requestArgs(serverUrl, apiKey, allowSelfSigned)
+    proc.command = Api.requestArgs(serverUrl, apiKey, allowSelfSigned, transport)
     proc.running = true
   }
 

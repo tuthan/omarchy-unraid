@@ -34,7 +34,7 @@ Panel {
   property var cpuHistory: []
   property var memHistory: []
   property var parityInfo: null
-  readonly property string dashboardUrl: hostWidget && hostWidget.serverUrl ? Api.dashboardUrl(hostWidget.serverUrl) : ""
+  readonly property string dashboardUrl: hostWidget && hostWidget.serverUrl ? Api.dashboardUrl(hostWidget.serverUrl, hostWidget.transport) : ""
   readonly property bool manageAllowed: configured && !!hostWidget && hostWidget.manageMode === true
 
   property string actionMessage: ""
@@ -67,7 +67,7 @@ Panel {
   function fetchParityInfo() {
     if (!hostWidget || !hostWidget.configured) return
     if (parityProc.running) return
-    parityProc.command = Api.parityRequestArgs(hostWidget.serverUrl, hostWidget.apiKey, hostWidget.allowSelfSigned)
+    parityProc.command = Api.parityRequestArgs(hostWidget.serverUrl, hostWidget.apiKey, hostWidget.allowSelfSigned, hostWidget.transport)
     parityProc.running = true
   }
 
@@ -122,6 +122,7 @@ Panel {
           color: diskRow.disk && !Api.diskOk(diskRow.disk.status) ? root.themeUrgent : root.fg
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
+          textFormat: Text.PlainText
         }
 
         Text {
@@ -257,6 +258,7 @@ Panel {
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       font.letterSpacing: 1
+      textFormat: Text.PlainText
     }
 
     Text {
@@ -267,6 +269,7 @@ Panel {
       color: line.alert ? root.themeUrgent : root.fg
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
+      textFormat: Text.PlainText
     }
   }
 
@@ -276,6 +279,7 @@ Panel {
     text: root.actionError !== "" ? root.actionError : root.actionMessage
     color: root.actionError !== "" ? root.themeUrgent : root.themeAccent
     elide: Text.ElideRight
+    textFormat: Text.PlainText
     font.family: root.fontFamily
     font.pixelSize: Style.font.caption
   }
@@ -311,16 +315,16 @@ Panel {
     console.warn("[unraid] action:", label)
     root.actionLabel = label
     root.queuedFollowUp = followUp || null
-    actionProc.command = Api.mutationArgs(hostWidget.serverUrl, hostWidget.apiKey, hostWidget.allowSelfSigned, queryText)
+    actionProc.command = Api.mutationArgs(hostWidget.serverUrl, hostWidget.apiKey, hostWidget.allowSelfSigned, queryText, hostWidget.transport)
     actionProc.running = true
   }
 
   function dockerMutation(action, id) {
-    return "mutation M { docker { " + action + "(id: \"" + id + "\") { id } } }"
+    return "mutation M { docker { " + action + "(id: " + JSON.stringify(String(id || "")) + ") { id } } }"
   }
 
   function vmMutation(action, id) {
-    return "mutation M { vm { " + action + "(id: \"" + id + "\") } }"
+    return "mutation M { vm { " + action + "(id: " + JSON.stringify(String(id || "")) + ") } }"
   }
 
   function arrayMutation(desiredState) {
@@ -396,6 +400,7 @@ Panel {
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       font.bold: true
+      textFormat: Text.PlainText
     }
 
     Timer {
@@ -440,12 +445,14 @@ Panel {
     return "Array " + snapshot.arrayState
   }
 
-  function saveSetupValues(url, key, poll) {
+  function saveSetupValues(url, key, poll, selectedTransport, selectedAllowSelfSigned) {
     if (!hostWidget || typeof hostWidget.saveSettings !== "function") return
     hostWidget.saveSettings({
       serverUrl: String(url).replace(/\s+/g, ""),
       apiKey: String(key).replace(/^\s+|\s+$/g, ""),
-      pollSeconds: Api.clampPollSeconds(poll)
+      pollSeconds: Api.clampPollSeconds(poll),
+      transport: selectedTransport === "http" ? "http" : "https",
+      allowSelfSigned: selectedAllowSelfSigned === true
     })
     setActive(0)
   }
@@ -458,7 +465,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight)
+    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(560))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -478,10 +485,20 @@ Panel {
         else if (t === "r" || t === "R") root.refreshAll()
       }
 
-      Column {
-        id: contentColumn
-        width: parent.width
-        spacing: Style.space(10)
+      Flickable {
+        id: panelScroll
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: contentColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+
+        Column {
+          id: contentColumn
+          width: panelScroll.width
+          spacing: Style.space(10)
 
         Row {
           width: parent.width
@@ -569,6 +586,7 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 font.bold: true
+                textFormat: Text.PlainText
               }
 
               Text {
@@ -577,6 +595,7 @@ Panel {
                 color: root.mutedFg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+                textFormat: Text.PlainText
               }
             }
           }
@@ -589,6 +608,8 @@ Panel {
         }
       }
     }
+  }
+
   }
 
   Component {
@@ -755,6 +776,7 @@ Panel {
         color: root.mutedFg
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
+        textFormat: Text.PlainText
       }
 
       Item {
@@ -989,6 +1011,7 @@ Panel {
             color: root.fg
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -998,6 +1021,7 @@ Panel {
             color: containerRow.running ? root.mutedFg : Qt.darker(root.mutedFg, 1.3)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -1086,6 +1110,7 @@ Panel {
             color: root.fg
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
           }
 
           Text {
@@ -1094,6 +1119,7 @@ Panel {
             color: vmRow.running ? root.mutedFg : Qt.darker(root.mutedFg, 1.3)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            textFormat: Text.PlainText
           }
 
           ActionButton {
@@ -1133,9 +1159,12 @@ Panel {
       id: setupColumn
       width: tabArea.width
       spacing: Style.space(6)
+      property string selectedTransport: "https"
+      property bool selectedAllowSelfSigned: false
 
       function commit() {
-        root.saveSetupValues(urlField.text, keyField.text, pollField.text)
+        root.saveSetupValues(urlField.text, keyField.text, pollField.text,
+          setupColumn.selectedTransport, setupColumn.selectedAllowSelfSigned)
       }
 
       Component.onCompleted: {
@@ -1143,6 +1172,8 @@ Panel {
         urlField.text = s.serverUrl !== undefined && s.serverUrl !== null ? String(s.serverUrl) : ""
         keyField.text = s.apiKey !== undefined && s.apiKey !== null ? String(s.apiKey) : ""
         pollField.text = String(root.hostWidget ? root.hostWidget.pollSeconds : 30)
+        setupColumn.selectedTransport = root.hostWidget ? root.hostWidget.transport : "https"
+        setupColumn.selectedAllowSelfSigned = root.hostWidget ? root.hostWidget.allowSelfSigned : false
       }
 
       Text {
@@ -1156,7 +1187,7 @@ Panel {
       TextField {
         id: urlField
         width: parent.width
-        placeholderText: "https://tower.local"
+        placeholderText: "tower.local"
         foreground: root.fg
         font.family: root.fontFamily
 
@@ -1168,6 +1199,130 @@ Panel {
             root.close()
             event.accepted = true
           }
+        }
+      }
+
+      Text {
+        text: "TRANSPORT"
+        color: root.mutedFg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 1
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Rectangle {
+          readonly property bool selected: setupColumn.selectedTransport === "https"
+          width: (parent.width - parent.spacing) / 2
+          height: httpsLabel.implicitHeight + Style.space(14)
+          radius: Style.space(4)
+          color: selected
+            ? Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.18)
+            : "transparent"
+          border.width: 1
+          border.color: selected ? root.themeAccent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
+
+          Text {
+            id: httpsLabel
+            anchors.centerIn: parent
+            text: "HTTPS"
+            color: selected ? root.themeAccent : root.mutedFg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: selected
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: setupColumn.selectedTransport = "https"
+          }
+        }
+
+        Rectangle {
+          readonly property bool selected: setupColumn.selectedTransport === "http"
+          width: (parent.width - parent.spacing) / 2
+          height: httpLabel.implicitHeight + Style.space(14)
+          radius: Style.space(4)
+          color: selected
+            ? Qt.rgba(root.themeUrgent.r, root.themeUrgent.g, root.themeUrgent.b, 0.18)
+            : "transparent"
+          border.width: 1
+          border.color: selected ? root.themeUrgent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
+
+          Text {
+            id: httpLabel
+            anchors.centerIn: parent
+            text: "HTTP"
+            color: selected ? root.themeUrgent : root.mutedFg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: selected
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: setupColumn.selectedTransport = "http"
+          }
+        }
+      }
+
+      Text {
+        width: parent.width
+        text: setupColumn.selectedTransport === "http"
+          ? "HTTP sends the API key without encryption. Use only on a trusted network."
+          : setupColumn.selectedAllowSelfSigned
+            ? "HTTPS encrypts the API key, but certificate verification is disabled."
+            : "HTTPS encrypts the API key in transit. Certificate verification is enabled by default."
+        color: setupColumn.selectedTransport === "http" || setupColumn.selectedAllowSelfSigned ? root.themeUrgent : root.mutedFg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
+      Rectangle {
+        id: selfSignedToggle
+        width: parent.width
+        height: selfSignedLabel.implicitHeight + Style.space(14)
+        radius: Style.space(4)
+        opacity: setupColumn.selectedTransport === "https" ? 1 : 0.45
+        color: selfSignedMouse.containsMouse && setupColumn.selectedTransport === "https"
+          ? Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.12)
+          : "transparent"
+
+        Text {
+          id: selfSignedLabel
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          text: setupColumn.selectedAllowSelfSigned ? "\u25CF Allow self-signed HTTPS certificate" : "\u25CB Verify HTTPS certificate"
+          color: setupColumn.selectedAllowSelfSigned ? root.themeUrgent : root.mutedFg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Text {
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          text: setupColumn.selectedAllowSelfSigned ? "ON" : "OFF"
+          color: setupColumn.selectedAllowSelfSigned ? root.themeUrgent : root.mutedFg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+
+        MouseArea {
+          id: selfSignedMouse
+          anchors.fill: parent
+          enabled: setupColumn.selectedTransport === "https"
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: setupColumn.selectedAllowSelfSigned = !setupColumn.selectedAllowSelfSigned
         }
       }
 

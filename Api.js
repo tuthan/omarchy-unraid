@@ -37,61 +37,85 @@ var PARITY_QUERY = [
     "}"
 ].join("\n")
 
-function graphqlUrl(serverUrl) {
+var MAX_RESPONSE_BYTES = 1024 * 1024
+var MAX_TEXT_LENGTH = 256
+var MAX_LIST_ITEMS = 256
+var MAX_CORE_ITEMS = 256
+var MAX_HISTORY_ITEMS = 90
+
+function boundedText(value, fallback, limit) {
+    var text = value === undefined || value === null ? fallback : String(value)
+    text = text.replace(/[\u0000-\u001f\u007f]/g, " ")
+    text = text.replace(/</g, "[").replace(/>/g, "]")
+    return text.length > limit ? text.slice(0, Math.max(0, limit - 3)) + "..." : text
+}
+
+function selectedTransport(serverUrl, transport) {
+    var value = String(transport || "").toLowerCase()
+    if (value === "http" || value === "https") return value
+    return /^http:\/\//i.test(String(serverUrl || "")) ? "http" : "https"
+}
+
+function graphqlUrl(serverUrl, transport) {
     var url = String(serverUrl || "").trim()
     if (url === "") return ""
-    if (!/:\/\//.test(url)) url = "https://" + url
+    if (url.length > 2048 || /[\u0000-\u0020\u007f]/.test(url)) return ""
+    var scheme = selectedTransport(url, transport)
+    var explicitScheme = url.match(/^([a-z][a-z0-9+.-]*):\/\//i)
+    if (explicitScheme && explicitScheme[1].toLowerCase() !== "http" && explicitScheme[1].toLowerCase() !== "https") return ""
+    if (explicitScheme) url = url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, scheme + "://")
+    else url = scheme + "://" + url
     url = url.replace(/\/+$/, "")
     if (!/\/graphql$/.test(url)) url += "/graphql"
     return url
 }
 
-function requestArgs(serverUrl, apiKey, allowSelfSigned) {
-    var args = ["curl", "-sS", "--max-time", "8"]
-    if (allowSelfSigned) args.push("-k")
+function requestArgs(serverUrl, apiKey, allowSelfSigned, transport) {
+    var args = ["curl", "-sS", "--max-time", "8", "--max-filesize", String(MAX_RESPONSE_BYTES)]
+    if (allowSelfSigned === true && selectedTransport(serverUrl, transport) === "https") args.push("-k")
     args.push("-H", "content-type: application/json")
     args.push("-H", "x-api-key: " + String(apiKey))
     args.push("--data-binary", JSON.stringify({ query: SUMMARY_QUERY }))
     args.push("-w", "\n%{http_code}")
-    args.push(graphqlUrl(serverUrl))
+    args.push(graphqlUrl(serverUrl, transport))
     return args
 }
 
-function parityRequestArgs(serverUrl, apiKey, allowSelfSigned) {
-    var args = ["curl", "-sS", "--max-time", "8"]
-    if (allowSelfSigned) args.push("-k")
+function parityRequestArgs(serverUrl, apiKey, allowSelfSigned, transport) {
+    var args = ["curl", "-sS", "--max-time", "8", "--max-filesize", String(MAX_RESPONSE_BYTES)]
+    if (allowSelfSigned === true && selectedTransport(serverUrl, transport) === "https") args.push("-k")
     args.push("-H", "content-type: application/json")
     args.push("-H", "x-api-key: " + String(apiKey))
     args.push("--data-binary", JSON.stringify({ query: PARITY_QUERY }))
     args.push("-w", "\n%{http_code}")
-    args.push(graphqlUrl(serverUrl))
+    args.push(graphqlUrl(serverUrl, transport))
     return args
 }
 
-function dashboardUrl(serverUrl) {
-    return graphqlUrl(serverUrl).replace(/\/graphql$/, "")
+function dashboardUrl(serverUrl, transport) {
+    return graphqlUrl(serverUrl, transport).replace(/\/graphql$/, "")
 }
 
-function mutationArgs(serverUrl, apiKey, allowSelfSigned, queryText) {
-    var args = ["curl", "-sS", "--max-time", "20"]
-    if (allowSelfSigned) args.push("-k")
+function mutationArgs(serverUrl, apiKey, allowSelfSigned, queryText, transport) {
+    var args = ["curl", "-sS", "--max-time", "20", "--max-filesize", String(MAX_RESPONSE_BYTES)]
+    if (allowSelfSigned === true && selectedTransport(serverUrl, transport) === "https") args.push("-k")
     args.push("-H", "content-type: application/json")
     args.push("-H", "x-api-key: " + String(apiKey))
     args.push("--data-binary", JSON.stringify({ query: queryText }))
     args.push("-w", "\n%{http_code}")
-    args.push(graphqlUrl(serverUrl))
+    args.push(graphqlUrl(serverUrl, transport))
     return args
 }
 
 function httpErrorMessage(code, body, stderr) {
     if (code === "") {
-        var detail = String(stderr || "").replace(/\s+$/, "").split("\n").pop()
-        return detail === "" ? "connection failed" : detail.slice(0, 140)
+        var detail = boundedText(String(stderr || "").replace(/\s+$/, "").split("\n").pop(), "", 140)
+        return detail === "" ? "connection failed" : detail
     }
     if (code === "401") return "unauthorized \u2014 check the API key"
     if (code === "403") return "forbidden \u2014 check the key's roles"
     if (code === "404") return "endpoint not found \u2014 check the server URL"
-    var snippet = String(body || "").trim()
+    var snippet = boundedText(String(body || "").trim(), "", 120)
     return "HTTP " + code + (snippet === "" ? "" : ": " + snippet.slice(0, 120))
 }
 
@@ -102,6 +126,7 @@ function numberOr(value) {
 
 function parseSummary(raw, stderr) {
     var full = String(raw || "")
+    if (full.length > MAX_RESPONSE_BYTES) return { ok: false, error: "response too large" }
     var code = ""
     var cut = full.lastIndexOf("\n")
     if (cut >= 0) {
@@ -125,8 +150,11 @@ function parseSummary(raw, stderr) {
         return { ok: false, error: "response was not valid JSON" }
     }
 
-    if (parsed.errors && parsed.errors.length > 0) {
-        var message = String((parsed.errors[0] || {}).message || "GraphQL error")
+    if (!parsed || typeof parsed !== "object")
+        return { ok: false, error: "response was not valid JSON" }
+
+    if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+        var message = boundedText((parsed.errors[0] || {}).message || "GraphQL error", "GraphQL error", MAX_TEXT_LENGTH)
         return { ok: false, error: message }
     }
 
@@ -139,7 +167,7 @@ function parseSummary(raw, stderr) {
         ok: true,
         error: "",
         snapshot: {
-            arrayState: String(array.state || "UNKNOWN").toUpperCase(),
+            arrayState: boundedText(array.state || "UNKNOWN", "UNKNOWN", 32).toUpperCase(),
             disks: mapDisks(array.disks),
             caches: mapDisks(array.caches),
             parities: mapDisks(array.parities),
@@ -153,12 +181,12 @@ function parseSummary(raw, stderr) {
 function mapDisks(disks) {
     var list = Array.isArray(disks) ? disks : []
     var out = []
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < Math.min(list.length, MAX_LIST_ITEMS); i++) {
         var d = list[i] || {}
         var temp = d.temp === undefined || d.temp === null ? null : numberOr(d.temp)
         out.push({
-            name: String(d.name || "?"),
-            status: String(d.status || "UNKNOWN").toUpperCase(),
+            name: boundedText(d.name || "?", "?", MAX_TEXT_LENGTH),
+            status: boundedText(d.status || "UNKNOWN", "UNKNOWN", 32).toUpperCase(),
             tempC: temp === null || temp < 0 ? null : temp,
             fsSize: numberOr(d.fsSize),
             fsUsed: numberOr(d.fsUsed),
@@ -199,6 +227,7 @@ function hottestDisk(disks) {
 
 function parseParity(raw, stderr) {
     var full = String(raw || "")
+    if (full.length > MAX_RESPONSE_BYTES) return { ok: false, error: "response too large" }
     var code = ""
     var cut = full.lastIndexOf("\n")
     if (cut >= 0) {
@@ -222,16 +251,20 @@ function parseParity(raw, stderr) {
         return { ok: false, error: "response was not valid JSON" }
     }
 
+    if (!parsed || typeof parsed !== "object")
+        return { ok: false, error: "response was not valid JSON" }
+
     if (!parsed.data)
         return { ok: false, error: "GraphQL error" }
 
     var data = parsed.data
-    var history = (data.parityHistory || []).filter(function(h) {
+    var historyList = Array.isArray(data.parityHistory) ? data.parityHistory.slice(0, MAX_HISTORY_ITEMS) : []
+    var history = historyList.filter(function(h) {
         return h && h.date && String(h.status).toUpperCase() === "COMPLETED" && Date.parse(h.date) > 0 && Date.parse(h.date) > 100000000000
     })
     var last = history.length > 0 ? history[0] : null
     var pcs = ((data.array || {}).parityCheckStatus) || {}
-    var status = String(pcs.status || "UNKNOWN").toUpperCase()
+    var status = boundedText(pcs.status || "UNKNOWN", "UNKNOWN", 32).toUpperCase()
 
     return {
         ok: true,
@@ -240,16 +273,17 @@ function parseParity(raw, stderr) {
             checkStatus: status === "NEVER_RUN" ? "NEVER RUN" : status,
             progress: pcs.progress !== null && pcs.progress !== undefined ? Number(pcs.progress) : null,
             errors: pcs.errors !== null && pcs.errors !== undefined ? Number(pcs.errors) : null,
-            lastDate: last ? last.date : null,
+            lastDate: last ? boundedText(last.date, "", MAX_TEXT_LENGTH) : null,
             lastDurationSec: last && last.duration !== null && last.duration !== undefined ? Number(last.duration) : null,
             lastErrors: last && last.errors !== null && last.errors !== undefined ? Number(last.errors) : null,
-            bootTime: (((data.info || {}).os) || {}).uptime || ""
+            bootTime: boundedText((((data.info || {}).os) || {}).uptime || "", "", MAX_TEXT_LENGTH)
         }
     }
 }
 
 function parseActionResult(raw, stderr) {
     var full = String(raw || "")
+    if (full.length > MAX_RESPONSE_BYTES) return { ok: false, error: "response too large" }
     var code = ""
     var cut = full.lastIndexOf("\n")
     if (cut >= 0) {
@@ -273,8 +307,11 @@ function parseActionResult(raw, stderr) {
         return { ok: false, error: "response was not valid JSON" }
     }
 
-    if (!parsed.data && parsed.errors && parsed.errors.length > 0) {
-        var message = String((parsed.errors[0] || {}).message || "GraphQL error")
+    if (!parsed || typeof parsed !== "object")
+        return { ok: false, error: "response was not valid JSON" }
+
+    if (!parsed.data && Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+        var message = boundedText((parsed.errors[0] || {}).message || "GraphQL error", "GraphQL error", MAX_TEXT_LENGTH)
         return { ok: false, error: message }
     }
 
@@ -310,10 +347,10 @@ function mapSystem(metrics, info) {    var m = metrics || {}
     var os = (info && info.os) || {}
     var cpuInfo = (info && info.cpu) || {}
     return {
-        cpuBrand: String(cpuInfo.brand || "").trim(),
-        hostname: String(os.hostname || "").trim(),
+        cpuBrand: boundedText(cpuInfo.brand || "", "", MAX_TEXT_LENGTH).trim(),
+        hostname: boundedText(os.hostname || "", "", MAX_TEXT_LENGTH).trim(),
         cpuPercent: cpu && cpu.percentTotal !== null && cpu.percentTotal !== undefined ? Math.round(cpu.percentTotal * 10) / 10 : null,
-        cores: cpu && cpu.cpus ? cpu.cpus.map(function(c) {
+        cores: cpu && Array.isArray(cpu.cpus) ? cpu.cpus.slice(0, MAX_CORE_ITEMS).map(function(c) {
             return c && c.percentTotal !== null && c.percentTotal !== undefined ? Math.round(c.percentTotal) : 0
         }) : [],
         memTotal: mem && mem.total !== null && mem.total !== undefined ? Number(mem.total) : 0,
@@ -328,13 +365,13 @@ function mapSystem(metrics, info) {    var m = metrics || {}
 function mapContainers(containers) {
     var list = Array.isArray(containers) ? containers : []
     var out = []
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < Math.min(list.length, MAX_LIST_ITEMS); i++) {
         var c = list[i] || {}
         var names = Array.isArray(c.names) && c.names.length > 0 ? c.names : ["?"]
         out.push({
-            id: String(c.id || ""),
-            name: String(names[0]).replace(/^\//, ""),
-            state: String(c.state || "UNKNOWN").toUpperCase(),
+            id: boundedText(c.id || "", "", MAX_TEXT_LENGTH),
+            name: boundedText(String(names[0]).replace(/^\//, ""), "?", MAX_TEXT_LENGTH),
+            state: boundedText(c.state || "UNKNOWN", "UNKNOWN", 32).toUpperCase(),
             autoStart: c.autoStart === true
         })
     }
@@ -344,12 +381,12 @@ function mapContainers(containers) {
 function mapVms(vms) {
     var list = Array.isArray(vms) ? vms : []
     var out = []
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < Math.min(list.length, MAX_LIST_ITEMS); i++) {
         var vm = list[i] || {}
         out.push({
-            id: String(vm.id || ""),
-            name: String(vm.name || "?"),
-            state: String(vm.state || "unknown").toLowerCase()
+            id: boundedText(vm.id || "", "", MAX_TEXT_LENGTH),
+            name: boundedText(vm.name || "?", "?", MAX_TEXT_LENGTH),
+            state: boundedText(vm.state || "unknown", "unknown", 32).toLowerCase()
         })
     }
     return out
@@ -373,18 +410,20 @@ function shortStatus(status) {
 
 function dockerCounts(containers) {
     var list = Array.isArray(containers) ? containers : []
+    var count = Math.min(list.length, MAX_LIST_ITEMS)
     var running = 0
-    for (var i = 0; i < list.length; i++)
+    for (var i = 0; i < count; i++)
         if (containerRunning(list[i].state)) running++
-    return { running: running, total: list.length }
+    return { running: running, total: count }
 }
 
 function vmCounts(vms) {
     var list = Array.isArray(vms) ? vms : []
+    var count = Math.min(list.length, MAX_LIST_ITEMS)
     var running = 0
-    for (var i = 0; i < list.length; i++)
+    for (var i = 0; i < count; i++)
         if (vmRunning(list[i].state)) running++
-    return { running: running, total: list.length }
+    return { running: running, total: count }
 }
 
 function statusLevel(snapshot) {
@@ -448,6 +487,9 @@ if (typeof module !== "undefined") {
         hottestDisk: hottestDisk,
         diskUsedPercent: diskUsedPercent,
         humanSize: humanSize,
-        mapSystem: mapSystem
+        mapSystem: mapSystem,
+        boundedText: boundedText,
+        MAX_RESPONSE_BYTES: MAX_RESPONSE_BYTES,
+        MAX_LIST_ITEMS: MAX_LIST_ITEMS
     }
 }
