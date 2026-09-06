@@ -879,7 +879,7 @@ Panel {
 
       Text {
         visible: sys && sys.memPercent !== null && sys.memTotal > 0
-        text: Api.humanSize(sys.memUsed) + " of " + Api.humanSize(sys.memTotal)
+        text: sys ? Api.humanSize(sys.memUsed) + " of " + Api.humanSize(sys.memTotal) : ""
         color: root.mutedFg
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -887,7 +887,7 @@ Panel {
 
       Text {
         visible: sys && sys.swapTotal > 0
-        text: "SWAP   \u00B7   " + (sys.swapPercent === null ? "\u2013" : sys.swapPercent + "%") + " of " + Api.humanSize(sys.swapTotal)
+        text: sys ? "SWAP   \u00B7   " + (sys.swapPercent === null ? "\u2013" : sys.swapPercent + "%") + " of " + Api.humanSize(sys.swapTotal) : ""
         color: root.mutedFg
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -1215,6 +1215,7 @@ Panel {
         spacing: Style.space(6)
 
         Rectangle {
+          id: httpsOption
           readonly property bool selected: setupColumn.selectedTransport === "https"
           width: (parent.width - parent.spacing) / 2
           height: httpsLabel.implicitHeight + Style.space(14)
@@ -1229,10 +1230,10 @@ Panel {
             id: httpsLabel
             anchors.centerIn: parent
             text: "HTTPS"
-            color: selected ? root.themeAccent : root.mutedFg
+            color: httpsOption.selected ? root.themeAccent : root.mutedFg
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
-            font.bold: selected
+            font.bold: httpsOption.selected
           }
 
           MouseArea {
@@ -1243,6 +1244,7 @@ Panel {
         }
 
         Rectangle {
+          id: httpOption
           readonly property bool selected: setupColumn.selectedTransport === "http"
           width: (parent.width - parent.spacing) / 2
           height: httpLabel.implicitHeight + Style.space(14)
@@ -1257,10 +1259,10 @@ Panel {
             id: httpLabel
             anchors.centerIn: parent
             text: "HTTP"
-            color: selected ? root.themeUrgent : root.mutedFg
+            color: httpOption.selected ? root.themeUrgent : root.mutedFg
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
-            font.bold: selected
+            font.bold: httpOption.selected
           }
 
           MouseArea {

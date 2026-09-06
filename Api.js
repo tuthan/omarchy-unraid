@@ -153,12 +153,14 @@ function parseSummary(raw, stderr) {
     if (!parsed || typeof parsed !== "object")
         return { ok: false, error: "response was not valid JSON" }
 
-    if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
-        var message = boundedText((parsed.errors[0] || {}).message || "GraphQL error", "GraphQL error", MAX_TEXT_LENGTH)
+    if (!parsed.data) {
+        var message = Array.isArray(parsed.errors) && parsed.errors.length > 0
+            ? boundedText((parsed.errors[0] || {}).message || "GraphQL error", "GraphQL error", MAX_TEXT_LENGTH)
+            : "GraphQL error"
         return { ok: false, error: message }
     }
 
-    var data = parsed.data || {}
+    var data = parsed.data
     var array = data.array || {}
     var info = data.info || {}
     var system = mapSystem(data.metrics, info)
