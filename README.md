@@ -1,7 +1,8 @@
 # Unraid
 
 An Omarchy Quickshell plugin that monitors and manages an Unraid server from
-the bar, over the native Unraid GraphQL API (Unraid 7.2+).
+the bar, over the native Unraid GraphQL API (Unraid 7.2+). Optional: launch
+container WebUIs and open VM consoles (VNC/SPICE) directly in app windows.
 
 ![Unraid plugin preview](preview.png)
 
@@ -76,6 +77,13 @@ Open the panel and switch to the **Setup** tab:
   available for containers, VMs, the array, and parity checks. Destructive
   actions confirm inline: the button turns into `CONFIRM?` for four seconds;
   click again to fire.
+- **VM console (SSH)** — off by default. When enabled, running VMs get an
+  `Open Console` button. The plugin runs a **read-only** `virsh dumpxml`
+  over SSH to find the VM's VNC/SPICE ports and opens the server's own
+  console page in an app window. Setup: install
+  `~/.ssh/id_ed25519_unraid.pub` as an authorized key for the SSH user
+  (`root` by default) on the Unraid server. The API never starts or stops a
+  VM for this; ports are fetched per click and never stored.
 - **Theme** — Unraid brand colors (orange accent) by default, or follow the
   Omarchy palette.
 
@@ -90,16 +98,59 @@ entry and survive restarts.
 - **System** — CPU and memory usage history graphs with a per-core breakdown,
   uptime, parity check status (last run, duration, errors), hottest disk
   temperature, and a link to open the Unraid web dashboard.
-- **Docker** — container list with state and autostart; start/stop/restart
+- **Docker** — container list with state, autostart, and (for running
+  containers with a valid WebUI URL from the container template) an
+  `Open WebUI` action with the resolved LAN destination; start/stop/restart
   per container when management is enabled.
 - **VMs** — virtual machine list with state; start/stop per VM when
   management is enabled.
 - **Setup** — configuration as described above.
 
+## Launching WebUIs
+
+Running containers can be opened directly in an app window when the Unraid
+API reports a WebUI URL for the container template. Behavior and limits:
+
+- **Optional API fields.** On the first poll of each connection the widget
+  probes the API for the optional `webUiUrl` field. Server builds or API key
+  roles that do not expose it keep monitoring but show no per-container WebUI
+  buttons; the tab-level **Open Unraid Docker** link remains available.
+- **Destination fidelity.** The container's own URL — scheme, host, port,
+  path, query string, and fragment — is preserved exactly. Template
+  destinations may point at a LAN host that is unreachable from the current
+  network; the plugin shows the destination but never rewrites it. Published
+  ports are informational and never used to construct launch URLs.
+- **Browser authentication and TLS are separate.** Launching the app does
+  not prove the page connected or authenticated: browser login, certificate
+  warnings, and target reachability are handled by the browser. The API
+  key and the self-signed-certificate setting apply to API calls only; the
+  plugin never adds API headers or keys to a launched destination.
+- **Launch handling.** Each launch runs the `omarchy-launch-webapp` helper
+  with the validated URL as a single argument (no shell). If the launch
+  cannot be confirmed, the panel offers an **Open in browser** fallback for
+  the same destination. Closing the panel does not terminate a launched app.
+- **Unraid page links.** `Open Unraid Docker` and `Open Unraid VMs` open the
+  server's Docker and VM pages; they work with management disabled.
+- **VM console (VNC/SPICE), optional.** The Unraid GraphQL API does not
+  expose VM graphics data at any build, so the plugin discovers console
+  ports read-only over SSH (`virsh dumpxml`) when the feature is enabled in
+  Setup. The console itself opens the server's `vnc.html`/`spice.html` page
+  through its websocket proxy (`/wsproxy/<port>/`), exactly like the Unraid
+  web UI does — your normal Unraid browser login applies, and SPICE VMs use
+  the same flow. VMs without a VNC/SPICE graphics device, or stopped VMs,
+  show no console button. Console discovery never boots a VM and never uses
+  `domain-start-console`. Without the SSH key there is no direct console
+  link — the console port is only readable by the webgui session itself;
+  use the `Open Unraid VMs` page and its per-VM console menu instead.
+- **No focus reuse.** Every click launches its destination in a fresh app
+  window; reusing an existing window is intentionally not implemented
+  (app-class identity across ports is unreliable).
+
 ## Keyboard
 
 - `1`–`5` switch tabs
 - `←`/`→` cycle tabs
+- `↓`/`↑` or `j`/`k` scroll the panel one list row at a time
 - `R` refresh
 - `Esc` close
 
@@ -114,6 +165,14 @@ entry and survive restarts.
   tab opens, not on every poll.
 - `RESTART` on a container is emulated as a chained stop followed by start,
   because the restart mutation is not available on current Unraid API builds.
+- Container and VM lists render through recycling `ListView`s. Mouse-wheel
+  speed follows Qt's flick-deceleration constant; this session tunes it via
+  `QT_QUICK_FLICKABLE_WHEEL_DECELERATION` (see `~/.config/uwsm/env.d/`), and
+  `↓`/`↑` or `j`/`k` scroll one row per press regardless.
+- Helper checks for the launch helpers live in
+  `tests/remote-console-access.test.cjs` (`node --test
+  tests/remote-console-access.test.cjs`); they validate URL parsing, query
+  composition, and response mapping without contacting a server.
 - Reboot/shutdown are not implemented: the Unraid GraphQL API does not expose
   them yet.
 - With multiple monitors, each bar widget targets its own server connection
