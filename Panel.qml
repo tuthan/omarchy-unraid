@@ -26,6 +26,21 @@ Panel {
   readonly property string lastError: hostWidget ? hostWidget.lastError : ""
   readonly property bool configured: hostWidget ? hostWidget.configured : false
   readonly property var dockerCounts: hostWidget && hostWidget.dockerCounts ? hostWidget.dockerCounts : { running: 0, total: 0 }
+  readonly property var favoriteNames: hostWidget ? hostWidget.favoriteNames : []
+  readonly property var dockerListModel: Api.sortContainersWithFavorites(
+    root.snapshot ? root.snapshot.containers : [], root.favoriteNames)
+  readonly property int configGeneration: hostWidget ? hostWidget.configGeneration : 0
+
+  readonly property string dockerPageUrl: {
+    if (!hostWidget || hostWidget.serverUrl === "") return ""
+    var page = Api.unraidPageUrl(hostWidget.serverUrl, hostWidget.transport, "Docker")
+    return page.ok ? page.url : ""
+  }
+  readonly property string vmsPageUrl: {
+    if (!hostWidget || hostWidget.serverUrl === "") return ""
+    var page = Api.unraidPageUrl(hostWidget.serverUrl, hostWidget.transport, "VMs")
+    return page.ok ? page.url : ""
+  }
 
   readonly property var tabs: ["Array", "System", "Docker", "VMs", "Setup"]
   property int activeIndex: 0
@@ -36,9 +51,325 @@ Panel {
   property var parityInfo: null
   readonly property string dashboardUrl: hostWidget && hostWidget.serverUrl ? Api.dashboardUrl(hostWidget.serverUrl, hostWidget.transport) : ""
   readonly property bool manageAllowed: configured && !!hostWidget && hostWidget.manageMode === true
+  readonly property bool sshConsoleEnabled: hostWidget ? hostWidget.sshConsole === true : false
+  readonly property string sshUser: hostWidget ? String(hostWidget.sshUser || "root") : "root"
 
   property string actionMessage: ""
   property string actionError: ""
+
+  // ---- Launch dispatch state (transient UI; never a persistent
+  // ---- preference). Kept at the panel root, outside tab delegates and
+  // ---- outside mutation processes.
+  property bool launchBusy: false
+  property string launchError: ""
+  property string launchFallbackUrl: ""
+  property int launchSequence: 0
+  property var currentLaunchJob: null
+
+  onConfigGenerationChanged: {
+    // New configuration: old-server destinations must not remain clickable
+    // and old launch callbacks may not act on a new popup session.
+    root.launchBusy = false
+    root.launchError = ""
+    root.launchFallbackUrl = ""
+    root.currentLaunchJob = null
+    root.consoleDiscoveryUuid = ""
+    root.cpuHistory = []
+    root.memHistory = []
+    root.parityInfo = null
+    if (root.activeIndex === 0 || root.activeIndex === 1) root.fetchParityInfo()
+  }
+
+  function dispatchWebapp(url, label) {
+    if (root.launchBusy) return
+    // Revalidate immediately before dispatch, not only when mapping results.
+    var v = Api.validateLaunchUrl(String(url || ""))
+    if (!v.ok) {
+      root.launchError = "That destination is no longer valid."
+      root.launchFallbackUrl = ""
+      return
+    }
+    // Selecting a different destination clears stale fallback state.
+    if (root.launchFallbackUrl !== "" && root.launchFallbackUrl !== v.url) {
+      root.launchError = ""
+      root.launchFallbackUrl = ""
+    }
+    root.launchBusy = true
+    root.launchError = ""
+    var job = launchJobComponent.createObject(root, {
+      jobUrl: v.url,
+      jobLabel: String(label || "web app"),
+      jobGeneration: root.configGeneration,
+      jobSequence: root.launchSequence + 1
+    })
+    if (!job) {
+      root.launchBusy = false
+      root.launchError = "Could not start the app launcher."
+      root.launchFallbackUrl = v.url
+      return
+    }
+    root.launchSequence++
+    root.currentLaunchJob = job
+    // Only argv invocation: never sh -c, eval, or focus lookup.
+    job.command = ["omarchy-launch-webapp", v.url]
+    job.running = true
+    launchWatchdog.restart()
+  }
+
+  // ---- VM console discovery: read-only SSH (virsh dumpxml), then the
+  // ---- server's own noVNC page through the normal dispatch flow. Never
+  // ---- uses domain-start-console; never starts or stops a VM.
+  function openVmConsole(vm) {
+    if (root.launchBusy) return
+    if (!hostWidget || !hostWidget.sshConsole) return
+    var uuid = String(vm && vm.id || "")
+    // PrefixedID carries the real uuid after the colon.
+    var colon = uuid.lastIndexOf(":")
+    if (colon !== -1) uuid = uuid.slice(colon + 1)
+    if (!Api.validateVmUuid(uuid)) {
+      root.launchError = "No console data available for this VM."
+      root.launchFallbackUrl = ""
+      return
+    }
+    var args = Api.sshDiscoveryArgs(hostWidget.sshUser, hostWidget.serverUrl, hostWidget.transport, uuid, Quickshell.env("HOME"))
+    if (args.length === 0) {
+      root.launchError = "Invalid SSH console configuration."
+      root.launchFallbackUrl = ""
+      return
+    }
+    root.launchBusy = true
+    root.launchError = ""
+    root.launchFallbackUrl = ""
+    root.consoleExitSeen = false
+    root.consoleDiscoveryUuid = uuid
+    root.consoleDiscoveryName = String(vm.name || "VM")
+    root.consoleDiscoveryGeneration = root.configGeneration
+    consoleProc.command = args
+    consoleProc.running = true
+    consoleWatchdog.restart()
+  }
+
+  property string consoleDiscoveryUuid: ""
+  property string consoleDiscoveryName: ""
+  property int consoleDiscoveryGeneration: -1
+  property bool consoleExitSeen: false
+
+  Process {
+    id: consoleProc
+
+    stdout: StdioCollector { id: consoleOut; waitForEnd: true }
+    stderr: StdioCollector { id: consoleErr; waitForEnd: true }
+
+    onExited: {
+      root.consoleExitSeen = true
+      if (root.consoleDiscoveryUuid === "") return
+      if (root.consoleDiscoveryGeneration !== root.configGeneration) {
+        root.consoleDiscoveryUuid = ""
+        root.launchBusy = false
+        consoleWatchdog.stop()
+        return
+      }
+      var result = Api.parseDomainGraphics(consoleOut.text)
+      if (!result.ok) {
+        var detail = Api.boundedText(String(consoleErr.text || "").replace(/\s+$/, "").split("\n").pop(), "", 140)
+        root.launchBusy = false
+        root.launchError = detail === "" || /BatchMode|Permission denied/i.test(detail)
+          ? "SSH console discovery failed \u2014 check the SSH key and that " + root.consoleDiscoveryName + " is running."
+          : detail
+        root.launchFallbackUrl = ""
+        consoleWatchdog.stop()
+        root.consoleDiscoveryUuid = ""
+        return
+      }
+      var url = Api.vmConsoleUrl(hostWidget.serverUrl, hostWidget.transport, result, root.consoleDiscoveryName)
+      if (!url.ok) {
+        root.launchBusy = false
+        root.launchError = "Could not build the console address: " + url.error
+        root.launchFallbackUrl = ""
+        consoleWatchdog.stop()
+        root.consoleDiscoveryUuid = ""
+        return
+      }
+      root.launchBusy = false
+      consoleWatchdog.stop()
+      root.consoleDiscoveryUuid = ""
+      root.dispatchWebapp(url.url, root.consoleDiscoveryName + " console")
+    }
+  }
+
+  Timer {
+    id: consoleWatchdog
+    interval: 12000
+    onTriggered: {
+      if (root.consoleDiscoveryUuid === "") return
+      if (consoleProc.running) {
+        consoleProc.signal(15)
+        root.launchError = "SSH console discovery timed out."
+        root.launchFallbackUrl = ""
+        root.launchBusy = false
+        root.consoleDiscoveryUuid = ""
+      } else if (!root.consoleExitSeen) {
+        // Spawn failure: ssh itself never started.
+        root.launchError = "Could not start the ssh client."
+        root.launchFallbackUrl = ""
+        root.launchBusy = false
+        root.consoleDiscoveryUuid = ""
+      }
+    }
+  }
+
+  function launchJobIsCurrent(job) {
+    return job !== null
+      && root.currentLaunchJob === job
+      && job.jobSequence === root.launchSequence
+      && job.jobGeneration === root.configGeneration
+  }
+
+  function acceptLaunch(job) {
+    if (!root.launchJobIsCurrent(job)) return
+    root.launchBusy = false
+    root.launchError = ""
+    root.launchFallbackUrl = ""
+    launchWatchdog.stop()
+    launchObserveTimer.stop()
+    root.close()
+  }
+
+  function failLaunch(message, fallbackUrl) {
+    if (root.currentLaunchJob === null || !root.launchJobIsCurrent(root.currentLaunchJob)) return
+    root.launchBusy = false
+    root.launchError = message
+    root.launchFallbackUrl = fallbackUrl
+    launchWatchdog.stop()
+    launchObserveTimer.stop()
+  }
+
+  function abandonLaunchJob(job) {
+    if (root.currentLaunchJob === job) {
+      root.currentLaunchJob = null
+      root.launchBusy = false
+      launchWatchdog.stop()
+      launchObserveTimer.stop()
+    }
+    Qt.callLater(job.destroy)
+  }
+
+  function openLaunchFallback() {
+    var v = Api.validateLaunchUrl(root.launchFallbackUrl)
+    if (!v.ok) {
+      root.launchError = "That destination is no longer valid."
+      root.launchFallbackUrl = ""
+      return
+    }
+    if (Qt.openUrlExternally(v.url)) {
+      root.launchError = ""
+      root.launchFallbackUrl = ""
+      root.launchBusy = false
+      root.close()
+    } else {
+      root.launchError = "Could not open the destination in a browser."
+    }
+  }
+
+  Component {
+    id: launchJobComponent
+
+    Process {
+      id: launchJob
+
+      property string jobUrl: ""
+      property string jobLabel: ""
+      property int jobGeneration: 0
+      property int jobSequence: 0
+      property bool jobStarted: false
+      property bool jobAccepted: false
+
+      // No stdout/stderr parsers: output is discarded (verified on the
+      // installed Quickshell 0.3.1) so it never reaches user-visible logs.
+      onStarted: {
+        launchJob.jobStarted = true
+        if (root.launchJobIsCurrent(launchJob)) launchObserveTimer.restart()
+      }
+
+      onRunningChanged: {
+        // Spawn failure: no start event is emitted and running flips false
+        // (installed Quickshell behavior). A normal exit always delivers
+        // started first, so this only catches failed-to-start.
+        if (!launchJob.running && !launchJob.jobStarted && !launchJob.jobAccepted
+            && root.launchJobIsCurrent(launchJob)) {
+          root.failLaunch("Could not launch " + launchJob.jobLabel + ".", launchJob.jobUrl)
+          Qt.callLater(function() {
+            if (root.currentLaunchJob === launchJob) root.currentLaunchJob = null
+            launchJob.destroy()
+          })
+        }
+      }
+
+      onExited: function(exitCode) {
+        var current = root.launchJobIsCurrent(launchJob)
+        if (current && launchJob.jobAccepted) {
+          root.abandonLaunchJob(launchJob)
+          return
+        }
+        if (current && (!launchJob.jobStarted || exitCode !== 0)) {
+          // Spawn failed before any start event, or an observed nonzero
+          // exit/crash: keep the popup open and offer fallback.
+          root.failLaunch("Could not launch " + launchJob.jobLabel + ".", launchJob.jobUrl)
+        } else if (current) {
+          // Zero exit counts as accepted dispatch; never claim connection.
+          root.acceptLaunch(launchJob)
+        }
+        Qt.callLater(function() {
+          if (root.currentLaunchJob === launchJob) root.currentLaunchJob = null
+          launchJob.destroy()
+        })
+      }
+    }
+  }
+
+  Timer {
+    id: launchObserveTimer
+    interval: 500
+    onTriggered: {
+      var job = root.currentLaunchJob
+      if (job && job.jobStarted && job.running) {
+        // Started and still running at window end: accepted dispatch only.
+        // Do not terminate the job.
+        job.jobAccepted = true
+        root.acceptLaunch(job)
+      }
+    }
+  }
+
+  Timer {
+    id: launchWatchdog
+    interval: 2000
+    onTriggered: {
+      var job = root.currentLaunchJob
+      if (!job || !root.launchJobIsCurrent(job)) return
+      if (job.jobAccepted) return
+      if (job.jobStarted && job.running) {
+        // Observation window missed; a started job still running counts as
+        // accepted dispatch.
+        job.jobAccepted = true
+        root.acceptLaunch(job)
+      } else if (!job.jobStarted && !job.running) {
+        // Missing launcher: no start event and nothing running.
+        root.failLaunch("Could not launch " + job.jobLabel + ".", job.jobUrl)
+        Qt.callLater(function() {
+          if (root.currentLaunchJob === job) root.currentLaunchJob = null
+          job.destroy()
+        })
+      } else {
+        // Ambiguous startup outcome: say it could not be confirmed and
+        // offer manual fallback; never launch a second browser, never kill.
+        root.launchBusy = false
+        root.launchError = "Could not confirm that " + job.jobLabel + " launched."
+        root.launchFallbackUrl = job.jobUrl
+        root.currentLaunchJob = null
+      }
+    }
+  }
 
   onSnapshotChanged: pushSystemPoint()
 
@@ -67,6 +398,7 @@ Panel {
   function fetchParityInfo() {
     if (!hostWidget || !hostWidget.configured) return
     if (parityProc.running) return
+    parityGeneration = root.configGeneration
     parityProc.command = Api.parityRequestArgs(hostWidget.serverUrl, hostWidget.apiKey, hostWidget.allowSelfSigned, hostWidget.transport)
     parityProc.running = true
   }
@@ -296,13 +628,18 @@ Panel {
     stderr: StdioCollector { id: parityErr; waitForEnd: true }
 
     onExited: {
+      // Late read-only results must not repopulate cleared server data.
+      if (parityGeneration !== root.configGeneration) return
       var result = Api.parseParity(parityOut.text, parityErr.text)
       root.parityInfo = result.ok ? result.parity : null
     }
   }
 
+  property int parityGeneration: -1
+
   property string actionLabel: ""
   property var queuedFollowUp: null
+  property int actionGeneration: -1
 
   function runAction(label, queryText, followUp) {
     if (!root.manageAllowed) return
@@ -314,6 +651,7 @@ Panel {
     if (actionProc.running) return
     console.warn("[unraid] action:", label)
     root.actionLabel = label
+    root.actionGeneration = root.configGeneration
     root.queuedFollowUp = followUp || null
     actionProc.command = Api.mutationArgs(hostWidget.serverUrl, hostWidget.apiKey, hostWidget.allowSelfSigned, queryText, hostWidget.transport)
     actionProc.running = true
@@ -352,6 +690,12 @@ Panel {
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
 
     onExited: {
+      // A late result cannot display old-server feedback or start a chained
+      // follow-up against the new server.
+      if (root.actionGeneration !== root.configGeneration) {
+        root.queuedFollowUp = null
+        return
+      }
       var result = Api.parseActionResult(actionOut.text, actionErr.text)
       if (result.ok && root.queuedFollowUp) {
         var next = root.queuedFollowUp
@@ -382,8 +726,8 @@ Panel {
     property bool armed: false
     signal clicked()
 
-    width: actionLabel.implicitWidth + Style.space(18)
-    height: actionLabel.implicitHeight + Style.space(8)
+    width: actionLabel.implicitWidth + Style.space(12)
+    height: actionLabel.implicitHeight + Style.space(6)
     radius: height / 2
     readonly property color fgColor: armed || destructive ? root.themeUrgent : root.themeAccent
     color: actionMouse.containsMouse
@@ -428,8 +772,84 @@ Panel {
     }
   }
 
+  // Navigation actions are independent of the management gate and of the
+  // four-second confirmation logic used by mutation buttons.
+  component NavigationButton: Rectangle {
+    id: navBtn
+
+    property string label: ""
+    property bool navEnabled: true
+    signal clicked()
+
+    width: navLabel.implicitWidth + Style.space(12)
+    height: navLabel.implicitHeight + Style.space(6)
+    radius: height / 2
+    opacity: navBtn.navEnabled ? 1 : 0.4
+    readonly property color fgColor: root.themeAccent
+    color: navBtn.navEnabled && navMouse.containsMouse
+      ? Qt.rgba(fgColor.r, fgColor.g, fgColor.b, 0.22)
+      : Qt.rgba(fgColor.r, fgColor.g, fgColor.b, 0.10)
+
+    Behavior on color { ColorAnimation { duration: 120 } }
+
+    Text {
+      id: navLabel
+      anchors.centerIn: parent
+      text: navBtn.label
+      color: navBtn.fgColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      textFormat: Text.PlainText
+    }
+
+    MouseArea {
+      id: navMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      enabled: navBtn.navEnabled && !root.launchBusy
+      onClicked: navBtn.clicked()
+    }
+  }
+
+  // Navigation error/fallback area: separate from mutation feedback so a
+  // launch failure never overwrites action banners.
+  component LaunchBanner: Column {
+    id: launchBanner
+
+    width: parent ? parent.width : 0
+    spacing: Style.space(6)
+    visible: root.launchError !== ""
+
+    Text {
+      width: parent.width
+      text: root.launchError
+      color: root.themeUrgent
+      elide: Text.ElideRight
+      textFormat: Text.PlainText
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    NavigationButton {
+      visible: root.launchFallbackUrl !== ""
+      label: "OPEN IN BROWSER"
+      onClicked: root.openLaunchFallback()
+    }
+  }
+
   function switchTabBy(delta) {
     setActive((activeIndex + delta + tabs.length) % tabs.length)
+  }
+
+  // Keyboard scrolling (Down/Up or j/k): one list row per press.
+  function scrollPanelBy(rows) {
+    if (!panelScroll.interactive) return
+    var step = Style.space(46) * rows
+    var max = Math.max(0, panelScroll.contentHeight - panelScroll.height)
+    panelScroll.contentY = Math.max(0, Math.min(max, panelScroll.contentY + step))
+    panelScroll.returnToBounds()
   }
 
   function refreshAll() {
@@ -445,14 +865,15 @@ Panel {
     return "Array " + snapshot.arrayState
   }
 
-  function saveSetupValues(url, key, poll, selectedTransport, selectedAllowSelfSigned) {
+  function saveSetupValues(url, key, poll, selectedTransport, selectedAllowSelfSigned, consoleUser) {
     if (!hostWidget || typeof hostWidget.saveSettings !== "function") return
     hostWidget.saveSettings({
       serverUrl: String(url).replace(/\s+/g, ""),
       apiKey: String(key).replace(/^\s+|\s+$/g, ""),
       pollSeconds: Api.clampPollSeconds(poll),
       transport: selectedTransport === "http" ? "http" : "https",
-      allowSelfSigned: selectedAllowSelfSigned === true
+      allowSelfSigned: selectedAllowSelfSigned === true,
+      sshUser: String(consoleUser || "root").replace(/\s+/g, "") || "root"
     })
     setActive(0)
   }
@@ -473,6 +894,7 @@ Panel {
 
       onMoveRequested: function(dx, dy) {
         if (dx !== 0) root.switchTabBy(dx > 0 ? 1 : -1)
+        if (dy !== 0) root.scrollPanelBy(dy)
       }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -499,6 +921,7 @@ Panel {
           id: contentColumn
           width: panelScroll.width
           spacing: Style.space(10)
+
 
         Row {
           width: parent.width
@@ -608,6 +1031,9 @@ Panel {
         }
       }
     }
+
+
+
   }
 
   }
@@ -972,91 +1398,215 @@ Panel {
       width: tabArea.width
       spacing: Style.space(6)
 
-      Text {
-        text: root.dockerCounts.running + " of " + root.dockerCounts.total + " containers running"
-        color: root.mutedFg
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+
+        Text {
+          width: parent.width - dockerPageButton.width - parent.spacing
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.dockerCounts.running + " of " + root.dockerCounts.total + " containers running"
+          color: root.mutedFg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        NavigationButton {
+          id: dockerPageButton
+          anchors.verticalCenter: parent.verticalCenter
+          label: "OPEN UNRAID DOCKER"
+          navEnabled: root.dockerPageUrl !== ""
+          onClicked: root.dispatchWebapp(root.dockerPageUrl, "Unraid Docker page")
+        }
       }
 
       ActionBanner {}
 
-      Repeater {
-        model: root.snapshot ? root.snapshot.containers : []
+      LaunchBanner {}
 
-        delegate: Row {
+      // ListView (not Repeater+Column): delegates churn on model changes
+      // instead of accumulating one static copy. Sizing to contentHeight
+      // keeps the outer Flickable as the only scroller, so for very long
+      // lists the item count is bounded by the list length, not virtualized.
+      ListView {
+        width: parent.width
+        height: contentHeight
+        interactive: false
+        reuseItems: true
+        cacheBuffer: 480
+        spacing: Style.space(2)
+        model: root.dockerListModel
+
+        delegate: Column {
           id: containerRow
 
           required property var modelData
 
           readonly property bool running: Api.containerRunning(modelData.state)
+          readonly property bool hasWebUi: running && modelData.webUiUrl !== ""
 
           width: tabArea.width
-          height: containerName.implicitHeight
-          spacing: Style.space(8)
+          spacing: Style.space(4)
 
-          Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(7)
-            height: width
-            radius: width / 2
-            color: containerRow.running ? root.themeAccent : root.mutedFg
+          Row {
+            id: containerLine
+            width: parent.width
+            height: containerName.implicitHeight
+            spacing: Style.space(6)
+
+            Rectangle {
+              id: containerDot
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(7)
+              height: width
+              radius: width / 2
+              color: containerRow.running ? root.themeAccent : root.mutedFg
+            }
+
+            Text {
+              id: containerName
+              width: Math.max(Style.space(40), parent.width
+                - containerDot.width - containerState.implicitWidth - containerAutoStart.implicitWidth
+                - containerPin.width - containerActions.width - parent.spacing * 5)
+              elide: Text.ElideRight
+              text: containerRow.modelData.name
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              textFormat: Text.PlainText
+            }
+
+            Text {
+              id: containerState
+              anchors.verticalCenter: parent.verticalCenter
+              width: implicitWidth
+              text: containerRow.modelData.state
+              color: containerRow.running ? root.mutedFg : Qt.darker(root.mutedFg, 1.3)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
+            }
+
+            Text {
+              id: containerAutoStart
+              anchors.verticalCenter: parent.verticalCenter
+              width: implicitWidth
+              text: containerRow.modelData.autoStart ? "\u21BB on" : ""
+              color: root.mutedFg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
+            }
+
+            // Favorite pin: explicit user action, persists by container name.
+            Rectangle {
+              id: containerPin
+              readonly property bool pinned: root.favoriteNames.indexOf(containerRow.modelData.name) !== -1
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(18)
+              height: width
+              radius: height / 2
+              color: pinMouse.containsMouse
+                ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                : "transparent"
+
+              Text {
+                anchors.centerIn: parent
+                text: containerPin.pinned ? "\u2605" : "\u2606"
+                color: containerPin.pinned ? root.themeAccent : root.mutedFg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              MouseArea {
+                id: pinMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  if (!root.hostWidget || typeof root.hostWidget.saveSettings !== "function") return
+                  root.hostWidget.saveSettings({
+                    dockerFavorites: Api.toggleFavoriteName(root.favoriteNames, containerRow.modelData.name)
+                  })
+                }
+              }
+            }
+
+            Row {
+              id: containerActions
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              ActionButton {
+                visible: root.manageAllowed && containerRow.running
+                label: "RESTART"
+                onClicked: root.runAction("Restart " + containerRow.modelData.name,
+                  root.dockerMutation("stop", containerRow.modelData.id),
+                  { label: "Start " + containerRow.modelData.name, query: root.dockerMutation("start", containerRow.modelData.id) })
+              }
+
+              ActionButton {
+                visible: root.manageAllowed && !containerRow.running
+                label: "START"
+                onClicked: root.runAction("Start " + containerRow.modelData.name,
+                  root.dockerMutation("start", containerRow.modelData.id), false)
+              }
+
+              ActionButton {
+                visible: root.manageAllowed && containerRow.running
+                label: "STOP"
+                destructive: true
+                needsConfirm: true
+                onClicked: root.runAction("Stop " + containerRow.modelData.name,
+                  root.dockerMutation("stop", containerRow.modelData.id))
+              }
+            }
           }
 
-          Text {
-            id: containerName
-            width: parent.width - Style.space(120) - (root.manageAllowed ? Style.space(190) : 0)
-            elide: Text.ElideRight
-            text: modelData.name
-            color: root.fg
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            textFormat: Text.PlainText
-          }
+          Row {
+            visible: containerRow.hasWebUi
+            width: parent.width
+            height: webUiDestination.implicitHeight
+            spacing: Style.space(6)
 
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(70)
-            text: modelData.state
-            color: containerRow.running ? root.mutedFg : Qt.darker(root.mutedFg, 1.3)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            textFormat: Text.PlainText
-          }
+            Item {
+              id: webUiIndent
+              anchors.verticalCenter: parent.verticalCenter
+              width: containerDot.width + parent.spacing
+              height: 1
+            }
 
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: modelData.autoStart ? "\u21BB on" : ""
-            color: root.mutedFg
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
+            Text {
+              id: webUiDestination
+              width: Math.max(Style.space(40), parent.width - webUiIndent.width - webUiOpenButton.width - parent.spacing * 2)
+              anchors.verticalCenter: parent.verticalCenter
+              elide: Text.ElideRight
+              text: containerRow.modelData.webUiDestination
+              color: root.mutedFg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
 
-          ActionButton {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.manageAllowed && containerRow.running
-            label: "RESTART"
-            onClicked: root.runAction("Restart " + containerRow.modelData.name,
-              root.dockerMutation("stop", containerRow.modelData.id),
-              { label: "Start " + containerRow.modelData.name, query: root.dockerMutation("start", containerRow.modelData.id) })
-          }
+              MouseArea {
+                id: destinationHover
+                anchors.fill: parent
+                hoverEnabled: true
+                acceptedButtons: Qt.NoButton
+              }
 
-          ActionButton {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.manageAllowed && !containerRow.running
-            label: "START"
-            onClicked: root.runAction("Start " + containerRow.modelData.name,
-              root.dockerMutation("start", containerRow.modelData.id), false)
-          }
+              PanelToolTip {
+                visible: destinationHover.containsMouse && webUiDestination.truncated
+                text: containerRow.modelData.webUiDestination
+                fontFamily: root.fontFamily
+              }
+            }
 
-          ActionButton {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.manageAllowed && containerRow.running
-            label: "STOP"
-            destructive: true
-            needsConfirm: true
-            onClicked: root.runAction("Stop " + containerRow.modelData.name,
-              root.dockerMutation("stop", containerRow.modelData.id))
+            NavigationButton {
+              id: webUiOpenButton
+              anchors.verticalCenter: parent.verticalCenter
+              label: "OPEN WEBUI"
+              onClicked: root.dispatchWebapp(containerRow.modelData.webUiUrl, containerRow.modelData.name + " WebUI")
+            }
           }
         }
       }
@@ -1078,12 +1628,40 @@ Panel {
       width: tabArea.width
       spacing: Style.space(6)
 
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Item {
+          width: parent.width - vmsPageButton.width - parent.spacing
+          height: vmsPageButton.height
+        }
+
+        NavigationButton {
+          id: vmsPageButton
+          anchors.verticalCenter: parent.verticalCenter
+          label: "OPEN UNRAID VMS"
+          navEnabled: root.vmsPageUrl !== ""
+          onClicked: root.dispatchWebapp(root.vmsPageUrl, "Unraid VMs page")
+        }
+      }
+
       ActionBanner {}
 
-      Repeater {
+      LaunchBanner {}
+
+      // Same ListView tradeoff as the Docker list: delegates churn on
+      // model changes instead of accumulating; not virtualized.
+      ListView {
+        width: parent.width
+        height: contentHeight
+        interactive: false
+        reuseItems: true
+        cacheBuffer: 480
+        spacing: Style.space(2)
         model: root.snapshot ? root.snapshot.vms : []
 
-        delegate: Row {
+        delegate: Column {
           id: vmRow
 
           required property var modelData
@@ -1091,53 +1669,86 @@ Panel {
           readonly property bool running: Api.vmRunning(modelData.state)
 
           width: tabArea.width
-          height: vmName.implicitHeight
-          spacing: Style.space(8)
+          spacing: Style.space(4)
 
-          Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(7)
-            height: width
-            radius: width / 2
-            color: vmRow.running ? root.themeAccent : root.mutedFg
+          Row {
+            id: vmLine
+            width: parent.width
+            height: vmName.implicitHeight
+            spacing: Style.space(6)
+
+            Rectangle {
+              id: vmDot
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(7)
+              height: width
+              radius: width / 2
+              color: vmRow.running ? root.themeAccent : root.mutedFg
+            }
+
+            Text {
+              id: vmName
+              width: Math.max(Style.space(40), parent.width
+                - vmDot.width - vmState.implicitWidth
+                - vmActions.width - parent.spacing * 3)
+              elide: Text.ElideRight
+              text: vmRow.modelData.name
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              textFormat: Text.PlainText
+            }
+
+            Text {
+              id: vmState
+              anchors.verticalCenter: parent.verticalCenter
+              width: implicitWidth
+              text: vmRow.modelData.state
+              color: vmRow.running ? root.mutedFg : Qt.darker(root.mutedFg, 1.3)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
+            }
+
+            Row {
+              id: vmActions
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              ActionButton {
+                visible: root.manageAllowed && !vmRow.running
+                label: "START"
+                onClicked: root.runAction("Start " + vmRow.modelData.name,
+                  root.vmMutation("start", vmRow.modelData.id), false)
+              }
+
+              ActionButton {
+                visible: root.manageAllowed && vmRow.running
+                label: "STOP"
+                destructive: true
+                needsConfirm: true
+                onClicked: root.runAction("Stop " + vmRow.modelData.name,
+                  root.vmMutation("stop", vmRow.modelData.id))
+              }
+            }
           }
 
-          Text {
-            id: vmName
-            width: parent.width - Style.space(90) - (root.manageAllowed ? Style.space(110) : 0)
-            elide: Text.ElideRight
-            text: modelData.name
-            color: root.fg
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            textFormat: Text.PlainText
-          }
+          Row {
+            visible: vmRow.running && hostWidget && hostWidget.sshConsole
+            width: parent.width
+            spacing: Style.space(6)
 
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: modelData.state
-            color: vmRow.running ? root.mutedFg : Qt.darker(root.mutedFg, 1.3)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            textFormat: Text.PlainText
-          }
+            Item {
+              anchors.verticalCenter: parent.verticalCenter
+              width: vmDot.width + parent.spacing
+              height: 1
+            }
 
-          ActionButton {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.manageAllowed && !vmRow.running
-            label: "START"
-            onClicked: root.runAction("Start " + vmRow.modelData.name,
-              root.vmMutation("start", vmRow.modelData.id), false)
-          }
-
-          ActionButton {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.manageAllowed && vmRow.running
-            label: "STOP"
-            destructive: true
-            needsConfirm: true
-            onClicked: root.runAction("Stop " + vmRow.modelData.name,
-              root.vmMutation("stop", vmRow.modelData.id))
+            NavigationButton {
+              anchors.verticalCenter: parent.verticalCenter
+              label: "OPEN CONSOLE"
+              onClicked: root.openVmConsole(vmRow.modelData)
+            }
           }
         }
       }
@@ -1164,7 +1775,7 @@ Panel {
 
       function commit() {
         root.saveSetupValues(urlField.text, keyField.text, pollField.text,
-          setupColumn.selectedTransport, setupColumn.selectedAllowSelfSigned)
+          setupColumn.selectedTransport, setupColumn.selectedAllowSelfSigned, sshUserField.text)
       }
 
       Component.onCompleted: {
@@ -1174,6 +1785,7 @@ Panel {
         pollField.text = String(root.hostWidget ? root.hostWidget.pollSeconds : 30)
         setupColumn.selectedTransport = root.hostWidget ? root.hostWidget.transport : "https"
         setupColumn.selectedAllowSelfSigned = root.hostWidget ? root.hostWidget.allowSelfSigned : false
+        sshUserField.text = root.sshUser
       }
 
       Text {
@@ -1460,6 +2072,88 @@ Panel {
             if (!root.hostWidget || typeof root.hostWidget.saveSettings !== "function") return
             root.hostWidget.saveSettings({ manageMode: !root.hostWidget.manageMode })
             if (root.hostWidget.manageMode) root.fetchParityInfo()
+          }
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(6)
+      }
+
+      Text {
+        text: "VM CONSOLE (SSH)"
+        color: root.mutedFg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 1
+      }
+
+      Text {
+        width: parent.width
+        text: "Add an Open Console button to running VMs. The plugin runs a read-only \"virsh dumpxml\" over SSH to find the VNC/SPICE port of a running VM, then opens the server's own console page in an app window (your normal Unraid browser login applies). The API never starts or stops a VM for this. Setup: install the key in ~/.ssh/id_ed25519_unraid.pub for your SSH user on the server."
+        color: root.mutedFg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
+      TextField {
+        id: sshUserField
+        width: parent.width
+        placeholderText: "SSH user (root)"
+        foreground: root.fg
+        font.family: root.fontFamily
+
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            setupColumn.commit()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Escape) {
+            root.close()
+            event.accepted = true
+          }
+        }
+      }
+
+      Rectangle {
+        id: sshConsoleToggle
+
+        width: parent.width
+        height: sshConsoleLabel.implicitHeight + Style.space(14)
+        radius: Style.space(4)
+        color: sshConsoleMouse.containsMouse ? Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.12) : "transparent"
+
+        Text {
+          id: sshConsoleLabel
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.sshConsoleEnabled ? "\u25CF Open Console buttons on running VMs" : "\u25CB No Open Console buttons"
+          color: root.sshConsoleEnabled ? root.themeAccent : root.mutedFg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Text {
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.sshConsoleEnabled ? "ON" : "OFF"
+          color: root.sshConsoleEnabled ? root.themeAccent : root.mutedFg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+
+        MouseArea {
+          id: sshConsoleMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            if (!root.hostWidget || typeof root.hostWidget.saveSettings !== "function") return
+            root.hostWidget.saveSettings({ sshConsole: !root.sshConsoleEnabled })
           }
         }
       }
